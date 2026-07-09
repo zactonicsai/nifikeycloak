@@ -1,0 +1,30 @@
+# ================================================================
+# Keycloak (latest) - Docker Compose
+# ================================================================
+# This is the SAME setup Terraform installs on the Keycloak EC2
+# server automatically. You can also run it anywhere Docker is
+# installed (even your own laptop) with:
+#
+#     docker compose up -d
+#
+# Then open:  http://localhost:8080   (admin / your password)
+#
+# NOTE: "start-dev" is Keycloak's practice mode - no HTTPS, no
+# external database. Great for learning, never for production.
+# ================================================================
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:latest   # currently Keycloak 26.7.x
+    container_name: keycloak
+    command: start-dev
+    restart: unless-stopped
+    ports:
+      - "8080:8080"                            # host door 8080 -> container door 8080
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ChangeMeAdmin123!
+    volumes:
+      - keycloak_data:/opt/keycloak/data       # keeps realms/users across restarts
+
+volumes:
+  keycloak_data:

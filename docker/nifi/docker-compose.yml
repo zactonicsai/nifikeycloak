@@ -1,0 +1,27 @@
+# ================================================================
+# Apache NiFi (latest) - Docker Compose
+# ================================================================
+# This is the SAME setup Terraform installs on the NiFi EC2
+# server automatically. Run anywhere with:
+#
+#     docker compose up -d
+#
+# Then open:  https://localhost:8443/nifi
+# (Click through the self-signed certificate warning.)
+#
+# NiFi starts in "single user" mode with the login below.
+# To switch it to Keycloak (OIDC) login, run
+# scripts/configure-nifi-oidc.sh on the server afterwards.
+# ================================================================
+services:
+  nifi:
+    image: apache/nifi:latest                  # currently NiFi 2.10.x
+    container_name: nifi
+    restart: unless-stopped
+    ports:
+      - "8443:8443"                            # NiFi's HTTPS web page
+    environment:
+      SINGLE_USER_CREDENTIALS_USERNAME: admin
+      SINGLE_USER_CREDENTIALS_PASSWORD: ChangeMeNifi12345!   # must be 12+ characters
+      NIFI_WEB_HTTPS_HOST: 0.0.0.0             # listen on all addresses
+      NIFI_WEB_PROXY_HOST: 0.0.0.0:8443        # accept any hostname (lab only)

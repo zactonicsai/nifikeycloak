@@ -1,0 +1,10 @@
+# Copy this file to terraform.tfvars and fill in your values.
+# terraform.tfvars is read automatically, so you won't need -var flags.
+
+my_ip           = "203.0.113.25/32"          # <- YOUR IP from https://checkip.amazonaws.com (keep the /32)
+public_key_path = "~/.ssh/tutorial-key.pub"
+aws_region      = "us-east-1"
+
+# Optional overrides:
+# keycloak_admin_password   = "ChangeMeAdmin123!"
+# nifi_single_user_password = "ChangeMeNifi12345!"
