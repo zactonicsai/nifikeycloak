@@ -66,6 +66,19 @@ resource "aws_instance" "keycloak" {
     COMPOSE
 
     cd /opt/keycloak && docker compose up -d
+
+    # LAB ONLY: wait for Keycloak to wake up, then allow plain HTTP
+    # on the master realm. Without this, browsing from the internet
+    # shows "We are sorry... HTTPS required".
+    for i in $(seq 1 60); do
+      if docker exec keycloak /opt/keycloak/bin/kcadm.sh config credentials \
+           --server http://localhost:8080 --realm master \
+           --user admin --password '${var.keycloak_admin_password}' 2>/dev/null; then
+        docker exec keycloak /opt/keycloak/bin/kcadm.sh update realms/master -s sslRequired=NONE
+        break
+      fi
+      sleep 10
+    done
   EOT
 
   tags = { Name = "keycloak-server" }
