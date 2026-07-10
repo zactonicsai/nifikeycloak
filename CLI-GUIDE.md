@@ -142,9 +142,10 @@ echo "Keycloak SG: $KC_SG_ID"
 aws ec2 authorize-security-group-ingress \
   --group-id $KC_SG_ID --protocol tcp --port 22 --cidr $MY_IP
 
-# Door 8080 (Keycloak web + OIDC): open to all — LAB ONLY!
+# Door 8443 (Keycloak HTTPS web + OIDC): open to all so both your
+# browser and the NiFi server can reach it
 aws ec2 authorize-security-group-ingress \
-  --group-id $KC_SG_ID --protocol tcp --port 8080 --cidr 0.0.0.0/0
+  --group-id $KC_SG_ID --protocol tcp --port 8443 --cidr 0.0.0.0/0
 ```
 
 ### Step 3.2 — NiFi's security group
@@ -247,7 +248,7 @@ NIFI_IP=$(aws ec2 describe-instances --instance-ids $NIFI_INSTANCE_ID \
   --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
 
 echo "=================================================="
-echo "Keycloak:      http://$KEYCLOAK_IP:8080"
+echo "Keycloak:      https://$KEYCLOAK_IP:8443"
 echo "NiFi:          https://$NIFI_IP:8443/nifi"
 echo "Redirect URI:  https://$NIFI_IP:8443/nifi-api/access/oidc/callback"
 echo "Logout URI:    https://$NIFI_IP:8443/nifi-api/access/oidc/logout/callback"

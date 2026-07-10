@@ -25,7 +25,9 @@ keycloak-nifi-tutorial/
 │   ├── keycloak/docker-compose.yml  <- run Keycloak anywhere with Docker
 │   └── nifi/docker-compose.yml      <- run NiFi anywhere with Docker
 └── scripts/
-    ├── configure-nifi-oidc.sh       <- one script to switch NiFi to Keycloak login
+    ├── configure-nifi-oidc.sh       <- switch NiFi to Keycloak login (imports the cert into NiFi's truststore too)
+    ├── generate-keycloak-cert.sh    <- (re)generate Keycloak's HTTPS certificate
+    ├── fix-keycloak-https.sh        <- LEGACY: only for plain-HTTP Keycloak setups
     ├── user-data-keycloak.sh        <- first-boot script for the Keycloak server
     └── user-data-nifi.sh            <- first-boot script for the NiFi server
 ```
@@ -72,11 +74,13 @@ Terraform prints the URLs and IPs you need (`keycloak_url`, `nifi_url`, `nifi_re
 
 ### 3. Log in to Keycloak
 
-Open the `keycloak_url` output → log in with `admin` / `ChangeMeAdmin123!` (or whatever you set in `terraform.tfvars`).
+Open the `keycloak_url` output — it's now **https on port 8443**. Your browser will warn about the certificate: the server generated its own "self-signed" cert at boot (real encryption, homemade ID card). Click **Advanced → Proceed**, then log in with `admin` / `ChangeMeAdmin123!` (or whatever you set in `terraform.tfvars`).
 
 ### 4. Create the realm
 
 Top-left dropdown → **Create realm** → name it exactly `nifi` → **Create**.
+
+(No Require SSL changes needed anymore — Keycloak runs HTTPS now, so its safe default setting just works.)
 
 ### 5. Create the client
 
@@ -114,7 +118,7 @@ ssh -i ~/.ssh/tutorial-key ubuntu@NIFI_IP
 ./configure-nifi-oidc.sh KEYCLOAK_IP YOUR_CLIENT_SECRET alice@example.com
 ```
 
-It checks connectivity, rewrites `nifi.properties` and `authorizers.xml`, and restarts NiFi. Wait 2–3 minutes.
+It checks connectivity, **downloads Keycloak's certificate and imports it into NiFi's truststore** (so NiFi trusts the self-signed cert), rewrites `nifi.properties` and `authorizers.xml`, and restarts NiFi. Wait 2–3 minutes.
 
 ### 9. Test the login 🎉
 
@@ -135,19 +139,40 @@ terraform destroy   # type "yes"
 | Port | Server | Purpose | Open to |
 |------|--------|---------|---------|
 | 22 | both | SSH remote control | your IP only |
-| 8080 | Keycloak | login pages + OIDC (HTTP) | everyone (lab only!) |
-| 8443 | NiFi | web UI (HTTPS) | your IP only |
+| 8443 | Keycloak | login pages + OIDC (HTTPS, self-signed cert) | everyone |
+| 8443 | NiFi | web UI (HTTPS, self-signed cert) | your IP only |
+
+(Both use 8443, but they're different machines — no conflict.)
 
 ---
 
-## Troubleshooting
+## Backup door: SSM Session Manager (no SSH key needed)
+
+Both servers now wear an IAM role (`terraform/iam.tf`) that lets you open a terminal on them through **AWS Systems Manager** — no SSH key, no port 22, and it works even if your IP changed. It's your "I locked myself out" escape hatch.
+
+**Easiest way — the browser:** AWS Console → EC2 → select the instance → **Connect** → **Session Manager** tab → **Connect**. You get a shell right in the browser.
+
+**From your terminal** (requires the [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html) for the AWS CLI):
+
+```bash
+terraform output ssm_nifi        # prints the exact command, e.g.:
+aws ssm start-session --target i-0abc123def456...
+```
+
+Two small gotchas:
+- SSM sessions log you in as user `ssm-user`, not `ubuntu` — run `sudo su - ubuntu` if you need Ubuntu's home folder, though `sudo docker ...` works directly.
+- After `terraform apply`, give the agent a minute or two to register before the Connect button lights up.
+
+---
 
 | Problem | Fix |
 |---------|-----|
 | Page won't load right after apply | Wait 5 min; then `ssh` in and check `sudo docker ps` / `sudo docker logs keycloak` (or `nifi`) |
+| "We are sorry... HTTPS required" | Shouldn't happen anymore (Keycloak runs HTTPS). If you see it, you're using an old `http://...:8080` URL — use `https://KEYCLOAK_IP:8443` |
+| NiFi login fails with a TLS/PKIX/certificate error | NiFi doesn't trust Keycloak's cert — re-run `configure-nifi-oidc.sh` (it re-imports the cert). Common after the Keycloak server got a new IP: run `generate-keycloak-cert.sh` on Keycloak FIRST, then the configure script on NiFi |
 | "Invalid redirect URI" from Keycloak | The URI in the client must exactly match the `nifi_redirect_uri` Terraform output |
 | Logged in but "insufficient permissions" | The admin email passed to the script must exactly match the user's email in Keycloak. Re-run the script — it clears `users.xml`/`authorizations.xml` so the Initial Admin is re-applied |
-| Script says it can't reach discovery URL | Create the `nifi` realm first (step 4); check Keycloak SG allows 8080 |
+| Script says it can't reach discovery URL | Create the `nifi` realm first (step 4); check Keycloak SG allows 8443 |
 | Everything's broken | `terraform destroy` then `terraform apply` — fresh start in minutes |
 
 More detail on every step, and every concept, in **GUIDE.md**.
@@ -156,10 +181,9 @@ More detail on every step, and every concept, in **GUIDE.md**.
 
 ## ⚠️ Lab shortcuts (do NOT do these in production)
 
-- Keycloak runs in `start-dev` mode over plain HTTP with port 8080 open to the world
-- NiFi uses a self-signed certificate (hence the browser warning)
+- Keycloak runs in `start-dev` mode; both servers use self-signed certificates (hence the browser warnings), and Keycloak's port 8443 is open to the world
+- Self-signed certs have the public IP baked in — stop/starting an instance changes its IP and breaks the cert (regenerate with `generate-keycloak-cert.sh`)
 - Passwords are written in config files instead of a secrets manager
 - Terraform state is stored locally instead of in S3
 
 GUIDE.md Part 10 explains what a production setup changes.
-# nifikeycloak

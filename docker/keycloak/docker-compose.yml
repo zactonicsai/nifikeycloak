@@ -1,16 +1,18 @@
 # ================================================================
-# Keycloak (latest) - Docker Compose
+# Keycloak (latest) over HTTPS - Docker Compose
 # ================================================================
-# This is the SAME setup Terraform installs on the Keycloak EC2
-# server automatically. You can also run it anywhere Docker is
-# installed (even your own laptop) with:
+# Keycloak now serves HTTPS on port 8443 using a certificate at
+# /opt/keycloak/certs/ on the host. Generate the cert FIRST with
+# scripts/generate-keycloak-cert.sh (the Terraform build does
+# this automatically at first boot), then:
 #
 #     docker compose up -d
 #
-# Then open:  http://localhost:8080   (admin / your password)
+# Open:  https://<SERVER_IP>:8443   (admin / your password)
+# Your browser will warn about the self-signed cert - expected.
 #
-# NOTE: "start-dev" is Keycloak's practice mode - no HTTPS, no
-# external database. Great for learning, never for production.
+# Because we use HTTPS, Keycloak's "Require SSL" setting can stay
+# at its safe default - no sslRequired=NONE hack needed.
 # ================================================================
 services:
   keycloak:
@@ -19,12 +21,15 @@ services:
     command: start-dev
     restart: unless-stopped
     ports:
-      - "8080:8080"                            # host door 8080 -> container door 8080
+      - "8443:8443"                            # HTTPS only - port 8080 is not exposed
     environment:
       KC_BOOTSTRAP_ADMIN_USERNAME: admin
       KC_BOOTSTRAP_ADMIN_PASSWORD: ChangeMeAdmin123!
+      KC_HTTPS_CERTIFICATE_FILE: /opt/keycloak/certs/keycloak.crt
+      KC_HTTPS_CERTIFICATE_KEY_FILE: /opt/keycloak/certs/keycloak.key
     volumes:
       - keycloak_data:/opt/keycloak/data       # keeps realms/users across restarts
+      - /opt/keycloak/certs:/opt/keycloak/certs:ro
 
 volumes:
   keycloak_data:

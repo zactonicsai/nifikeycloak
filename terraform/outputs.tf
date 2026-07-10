@@ -4,13 +4,13 @@ output "keycloak_public_ip" {
 }
 
 output "keycloak_url" {
-  description = "Open this in your browser"
-  value       = "http://${aws_instance.keycloak.public_ip}:8080"
+  description = "Open this in your browser (expect a certificate warning - self-signed)"
+  value       = "https://${aws_instance.keycloak.public_ip}:8443"
 }
 
 output "oidc_discovery_url" {
   description = "The URL NiFi uses to find Keycloak (after you create the nifi realm)"
-  value       = "http://${aws_instance.keycloak.public_ip}:8080/realms/nifi/.well-known/openid-configuration"
+  value       = "https://${aws_instance.keycloak.public_ip}:8443/realms/nifi/.well-known/openid-configuration"
 }
 
 output "nifi_public_ip" {

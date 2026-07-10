@@ -34,7 +34,7 @@ Here's a picture of what we're building:
               |   |  +----------------+  |   |
               |   |  | Keycloak EC2   |  |   |
               |   |  | (security desk)|  |   |
-              |   |  |   port 8080    |  |   |
+              |   |  |   port 8443    |  |   |
               |   |  +-------+--------+  |   |
               |   |          |           |   |
               |   |  +-------+--------+  |   |
@@ -53,7 +53,7 @@ Here's a picture of what we're building:
 | **EC2 instance** | A computer you rent from Amazon. It lives in their building, but you control it. |
 | **VPC** | Virtual Private Cloud. Your own private, fenced-off section of Amazon's network. Like having your own gated neighborhood. |
 | **Subnet** | A smaller street inside your gated neighborhood. A **public subnet** has a gate to the internet; a private one doesn't. |
-| **Security Group** | A bouncer standing in front of each computer. It has a list of rules: "Only let in visitors knocking on door 8080" or "Only let in people from THIS address." |
+| **Security Group** | A bouncer standing in front of each computer. It has a list of rules: "Only let in visitors knocking on door 8443" or "Only let in people from THIS address." |
 | **Port** | A numbered door on a computer. Computers have 65,535 doors. Each program listens at a specific door. Web traffic usually uses door 80 or 443, SSH uses door 22, and so on. |
 | **Terraform** | A tool that reads your "instruction booklet" (files ending in `.tf`) and builds cloud stuff automatically. |
 | **Keycloak** | An open-source "identity provider." It stores users and passwords and hands out digital hall passes (tokens). |
@@ -66,8 +66,8 @@ Here's a picture of what we're building:
 | Port | Who uses it | What it's for |
 |------|-------------|---------------|
 | **22** | Both servers | SSH — the remote control that lets you type commands on the server from your laptop |
-| **8080** | Keycloak | Keycloak's web page (HTTP — not encrypted, fine for learning, NOT for real production) |
-| **8443** | NiFi | NiFi's web page (HTTPS — encrypted) |
+| **8443** | Keycloak | Keycloak's web page (HTTPS — encrypted with a self-signed certificate) |
+| **8443** | NiFi | NiFi's web page (HTTPS — same port number, different machine, no conflict) |
 
 ---
 
@@ -267,7 +267,7 @@ resource "aws_route_table_association" "public" {
 # BOUNCER #1: The Keycloak security group.
 # Rules:
 #   - Door 22 (SSH): only YOUR laptop
-#   - Door 8080 (Keycloak web page): open, because BOTH your
+#   - Door 8443 (Keycloak HTTPS web page): open, because BOTH your
 #     browser AND the NiFi server need to talk to Keycloak.
 # ---------------------------------------------------------------
 resource "aws_security_group" "keycloak" {
@@ -284,9 +284,9 @@ resource "aws_security_group" "keycloak" {
   }
 
   ingress {
-    description = "Keycloak web + OIDC traffic"
-    from_port   = 8080
-    to_port     = 8080
+    description = "Keycloak HTTPS web + OIDC traffic"
+    from_port   = 8443
+    to_port     = 8443
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"] # See warning below!
   }
@@ -345,11 +345,11 @@ resource "aws_security_group" "nifi" {
 }
 ```
 
-> ⚠️ **Why is Keycloak's port 8080 open to everyone (`0.0.0.0/0`)?** Two different "visitors" need to reach Keycloak:
+> ⚠️ **Why is Keycloak's port 8443 open to everyone (`0.0.0.0/0`)?** Two different "visitors" need to reach Keycloak:
 > 1. **Your browser**, to see the login page.
 > 2. **The NiFi server itself**, behind the scenes, to verify tokens. NiFi reaches out from its own public IP, which we don't know until after everything is built.
 >
-> For a learning lab, opening 8080 is the simplest fix. **In a real production system you would never do this** — you'd lock it down to specific IPs, put Keycloak behind HTTPS with a real certificate, and probably use a load balancer. Big warning delivered!
+> Since Keycloak now runs HTTPS, the traffic is at least encrypted — but in production you'd still lock this down to specific IPs and use a certificate from a real authority.
 
 ### Step 3.6 — `servers.tf` (the two computers)
 
@@ -384,12 +384,14 @@ resource "aws_key_pair" "tutorial" {
 }
 
 # ---------------------------------------------------------------
-# SERVER #1: KEYCLOAK
+# SERVER #1: KEYCLOAK (HTTPS)
 # The user_data script:
 #   1. installs Docker (a tool that runs apps in neat little boxes
 #      called containers)
-#   2. pulls the LATEST official Keycloak image
-#   3. starts it in "dev mode" on port 8080 with an admin login
+#   2. creates a self-signed TLS CERTIFICATE with this server's
+#      public IP baked into it (more on certs below!)
+#   3. starts the LATEST official Keycloak image in "dev mode",
+#      serving HTTPS on port 8443 with that certificate
 # ---------------------------------------------------------------
 resource "aws_instance" "keycloak" {
   ami                    = data.aws_ami.ubuntu.id
@@ -397,20 +399,43 @@ resource "aws_instance" "keycloak" {
   subnet_id              = aws_subnet.public.id
   vpc_security_group_ids = [aws_security_group.keycloak.id]
   key_name               = aws_key_pair.tutorial.key_name
+  iam_instance_profile   = aws_iam_instance_profile.ssm.name
 
   user_data = <<-EOF
     #!/bin/bash
     set -e
     apt-get update -y
-    apt-get install -y docker.io
+    apt-get install -y docker.io docker-compose-v2 openssl
     systemctl enable --now docker
 
+    # 1. Ask AWS "what's my public IP?" and make a certificate for it
+    CERT_DIR=/opt/keycloak/certs
+    mkdir -p $CERT_DIR
+    TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" \
+      -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+    PUBLIC_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+      http://169.254.169.254/latest/meta-data/public-ipv4)
+
+    openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+      -keyout $CERT_DIR/keycloak.key \
+      -out $CERT_DIR/keycloak.crt \
+      -subj "/CN=keycloak" \
+      -addext "subjectAltName=IP:$PUBLIC_IP"
+
+    chown 1000:1000 $CERT_DIR/keycloak.key $CERT_DIR/keycloak.crt
+    chmod 600 $CERT_DIR/keycloak.key
+    chmod 644 $CERT_DIR/keycloak.crt
+
+    # 2. Start Keycloak over HTTPS with that certificate
     docker run -d \
       --name keycloak \
       --restart unless-stopped \
-      -p 8080:8080 \
+      -p 8443:8443 \
+      -v $CERT_DIR:/opt/keycloak/certs:ro \
       -e KC_BOOTSTRAP_ADMIN_USERNAME=admin \
       -e KC_BOOTSTRAP_ADMIN_PASSWORD=ChangeMeAdmin123! \
+      -e KC_HTTPS_CERTIFICATE_FILE=/opt/keycloak/certs/keycloak.crt \
+      -e KC_HTTPS_CERTIFICATE_KEY_FILE=/opt/keycloak/certs/keycloak.key \
       quay.io/keycloak/keycloak:latest \
       start-dev
   EOF
@@ -419,6 +444,17 @@ resource "aws_instance" "keycloak" {
     Name = "keycloak-server"
   }
 }
+```
+
+> 🧠 **What's a certificate? What's a truststore?** Time for the two most important security words in this whole guide:
+>
+> A **certificate** is a signed name tag: "I am 54.12.34.56, and here is a tamper-proof stamp proving it." When your browser (or NiFi) connects over HTTPS, the server shows its certificate, and the visitor checks two things: *is the stamp valid?* and *does the name on the tag match the address I dialed?* That second check is why our script bakes the server's public IP into the cert (the `subjectAltName` line).
+>
+> Ours is **self-signed**: we stamped it ourselves instead of paying a trusted authority like Let's Encrypt or DigiCert. The encryption is exactly as strong — but nobody recognizes our homemade stamp, so browsers show a warning, and programs like NiFi refuse to connect at all... unless we add our cert to their **truststore**.
+>
+> A **truststore** is a program's personal address book of stamps it believes. Your browser ships with hundreds of famous ones built in. NiFi keeps its own in a file called `truststore.p12`. In Part 7, we'll download Keycloak's certificate and add it to NiFi's truststore — after that, NiFi trusts Keycloak completely, warnings gone.
+
+```hcl
 
 # ---------------------------------------------------------------
 # SERVER #2: NIFI
@@ -475,7 +511,7 @@ output "keycloak_public_ip" {
 
 output "keycloak_url" {
   description = "Open this in your browser"
-  value       = "http://${aws_instance.keycloak.public_ip}:8080"
+  value       = "https://${aws_instance.keycloak.public_ip}:8443"
 }
 
 output "nifi_public_ip" {
@@ -528,7 +564,7 @@ terraform apply -var 'my_ip=YOUR.IP.ADDRESS.HERE/32'
 Type `yes` when asked. In 2–3 minutes, Terraform prints your outputs:
 
 ```
-keycloak_url = "http://54.12.34.56:8080"
+keycloak_url = "https://54.12.34.56:8443"
 nifi_url     = "https://54.98.76.54:8443/nifi"
 ...
 ```
@@ -539,7 +575,7 @@ nifi_url     = "https://54.98.76.54:8443/nifi"
 
 ### Step 4.4 — Check that both are alive
 
-- Open `http://KEYCLOAK_IP:8080` → you should see the Keycloak welcome/login page.
+- Open `https://KEYCLOAK_IP:8443` → your browser will warn about the self-signed certificate (homemade ID card — real encryption, no official stamp). Click **Advanced → Proceed**. You should see the Keycloak welcome/login page.
 - Open `https://NIFI_IP:8443/nifi` → your browser will scream about an untrusted certificate. That's expected! NiFi made its own "self-signed" certificate, which is like a homemade ID card — real encryption, but no official stamp. Click **Advanced → Proceed anyway**. Log in with `admin` / `ChangeMeNifi12345!`.
 
 ---
@@ -550,7 +586,7 @@ Time to configure the security desk.
 
 ### Step 5.1 — Log in as admin
 
-1. Go to `http://KEYCLOAK_IP:8080`
+1. Go to `https://KEYCLOAK_IP:8443`
 2. Username: `admin`, Password: `ChangeMeAdmin123!`
 
 ### Step 5.2 — Create the NiFi realm
@@ -562,7 +598,7 @@ Remember: a **realm** is a separate school with its own student list.
 3. **Realm name:** `nifi` (all lowercase — exact spelling matters later!)
 4. Click **Create**.
 
-You're now inside the `nifi` realm. Everything we do next happens here.
+You're now inside the `nifi` realm. Everything we do next happens here. (Because Keycloak runs over HTTPS, its "Require SSL" safety setting is satisfied automatically — nothing to change.)
 
 ### Step 5.3 — Create a client for NiFi
 
@@ -624,7 +660,7 @@ Repeat the same steps with:
 Open a private/incognito browser window and go to:
 
 ```
-http://KEYCLOAK_IP:8080/realms/nifi/account
+https://KEYCLOAK_IP:8443/realms/nifi/account
 ```
 
 Log in as `alice`. If you see her account page, your realm works! 🎉
@@ -659,7 +695,7 @@ Key idea: **NiFi never sees Alice's password.** Only Keycloak does. NiFi just ge
 The address NiFi uses to find Keycloak is called the **discovery URL**. It's a menu of all Keycloak's endpoints, published at a standard location:
 
 ```
-http://KEYCLOAK_IP:8080/realms/nifi/.well-known/openid-configuration
+https://KEYCLOAK_IP:8443/realms/nifi/.well-known/openid-configuration
 ```
 
 Paste that into your browser right now — you'll see a big page of JSON. If you see it, NiFi will be able to see it too.
@@ -678,6 +714,8 @@ ssh -i ~/.ssh/tutorial-key ubuntu@NIFI_IP
 
 (Type `yes` if asked about fingerprints.)
 
+> 💡 **Shortcut:** the project's `scripts/configure-nifi-oidc.sh` runs every command in Steps 7.2–7.4 for you (including the certificate download and truststore import): `./configure-nifi-oidc.sh KEYCLOAK_IP CLIENT_SECRET alice@example.com`. Read on to understand what it does.
+
 ### Step 7.2 — Edit NiFi's settings inside the container
 
 NiFi's brain lives in a file called `nifi.properties`. We'll change five settings. Copy-paste this whole block **after replacing the two placeholders** (`KEYCLOAK_IP` and `YOUR_CLIENT_SECRET`):
@@ -690,9 +728,28 @@ CLIENT_SECRET="YOUR_CLIENT_SECRET"          # from Keycloak, Step 5.4
 
 P=/opt/nifi/nifi-current/conf/nifi.properties
 
-# 1. Tell NiFi where Keycloak's "menu" (discovery document) is
+# 0a. Download Keycloak's certificate straight from port 8443
+openssl s_client -connect $KEYCLOAK_IP:8443 </dev/null 2>/dev/null \
+  | openssl x509 > /tmp/keycloak.crt
+sudo docker cp /tmp/keycloak.crt nifi:/tmp/keycloak.crt
+
+# 0b. Import it into NiFi's truststore (its address book of trusted
+#     stamps). The truststore password was auto-generated at first
+#     boot and lives in nifi.properties - read it out first.
+TRUST_PASS=$(sudo docker exec nifi grep '^nifi.security.truststorePasswd=' $P | cut -d= -f2)
+sudo docker exec nifi keytool -importcert -noprompt -alias keycloak \
+  -file /tmp/keycloak.crt \
+  -keystore /opt/nifi/nifi-current/conf/truststore.p12 \
+  -storetype PKCS12 -storepass "$TRUST_PASS"
+
+# 0c. Tell NiFi to use ITS OWN truststore (not Java's built-in one)
+#     when making OIDC calls to Keycloak
 sudo docker exec nifi sed -i \
-  "s|^nifi.security.user.oidc.discovery.url=.*|nifi.security.user.oidc.discovery.url=http://$KEYCLOAK_IP:8080/realms/nifi/.well-known/openid-configuration|" $P
+  "s|^nifi.security.user.oidc.truststore.strategy=.*|nifi.security.user.oidc.truststore.strategy=NIFI|" $P
+
+# 1. Tell NiFi where Keycloak's "menu" (discovery document) is - HTTPS now!
+sudo docker exec nifi sed -i \
+  "s|^nifi.security.user.oidc.discovery.url=.*|nifi.security.user.oidc.discovery.url=https://$KEYCLOAK_IP:8443/realms/nifi/.well-known/openid-configuration|" $P
 
 # 2. Tell NiFi its client ID (its name at the security desk)
 sudo docker exec nifi sed -i \
@@ -779,7 +836,9 @@ Now Bob can log in and see the canvas, but he can't change anything unless Alice
 | Browser blocks NiFi entirely | Self-signed certificate | Click Advanced → Proceed. Some corporate laptops forbid this. |
 | "Invalid redirect URI" error from Keycloak | Redirect URI in the client doesn't exactly match | In Keycloak → Clients → nifi → check the URI. It must be `https://NIFI_IP:8443/nifi-api/access/oidc/callback` — exact IP, exact path, no trailing slash. |
 | Login works but "insufficient permissions" | Identity mismatch | The Initial Admin Identity (`alice@example.com`) must exactly match the email claim from Keycloak — same case, same spelling. Check `sudo docker logs nifi` for the identity NiFi actually saw. Also: NiFi only reads Initial Admin Identity when its `users.xml`/`authorizations.xml` don't exist yet. If you got it wrong once, delete them and restart: `sudo docker exec nifi rm /opt/nifi/nifi-current/conf/users.xml /opt/nifi/nifi-current/conf/authorizations.xml && sudo docker restart nifi` |
-| NiFi can't reach the discovery URL | Security group or wrong IP | From the NiFi server run: `curl http://KEYCLOAK_IP:8080/realms/nifi/.well-known/openid-configuration` — if it fails, check the Keycloak security group allows port 8080. |
+| "We are sorry... HTTPS required" | Using an old plain-HTTP URL | Keycloak is HTTPS now — use `https://KEYCLOAK_IP:8443` |
+| NiFi shows a TLS / PKIX / "unable to find valid certification path" error | NiFi doesn't trust Keycloak's self-signed cert | Re-run `configure-nifi-oidc.sh` — it downloads the current cert and imports it into NiFi's truststore |
+| NiFi can't reach the discovery URL | Security group or wrong IP | From the NiFi server run: `curl -k https://KEYCLOAK_IP:8443/realms/nifi/.well-known/openid-configuration` — if it fails, check the Keycloak security group allows port 8443. |
 | Everything broke and you're sad | Nuclear option | `terraform destroy`, then `terraform apply` again. Fresh start in 5 minutes. That's the beauty of Terraform. |
 
 ---
@@ -802,13 +861,13 @@ Double-check in the AWS Console (EC2 → Instances) that both instances say "ter
 
 This lab cuts corners on purpose so you can learn. A production setup would add:
 
-1. **HTTPS everywhere** — Keycloak behind a real TLS certificate (e.g., from Let's Encrypt) and a proper domain name, not a raw IP. OIDC over plain HTTP is only acceptable in a lab.
+1. **Real certificates** — we use HTTPS everywhere now, but with self-signed certs. Production uses certificates from a trusted authority (e.g., Let's Encrypt) and proper domain names instead of raw IPs — then no browser warnings and no manual truststore imports.
 2. **A real database for Keycloak** — dev mode uses a throwaway file database. Production uses PostgreSQL, and `start` instead of `start-dev`.
 3. **Private subnets** — the servers would live on a private street with no internet gate, reachable only through a load balancer or bastion host.
-4. **Tighter security groups** — no `0.0.0.0/0` on port 8080. Server-to-server rules would reference security group IDs instead of IPs.
+4. **Tighter security groups** — no `0.0.0.0/0` on Keycloak's port 8443. Server-to-server rules would reference security group IDs instead of IPs.
 5. **Secrets management** — the client secret and admin passwords would live in AWS Secrets Manager, never in plain text or Terraform files.
 6. **Remote Terraform state** — the `terraform.tfstate` file would be stored in S3 with locking, so a team can share it safely.
-7. **Real certificates for NiFi** — no more browser warnings.
+7. **Certificates that survive IP changes** — our certs have the public IP baked in, so a stop/start (new IP) breaks them. Domains + real certs fix this.
 
 ---
 
@@ -816,16 +875,16 @@ This lab cuts corners on purpose so you can learn. A production setup would add:
 
 | Thing | Value |
 |-------|-------|
-| Keycloak admin console | `http://KEYCLOAK_IP:8080` (admin / ChangeMeAdmin123!) |
+| Keycloak admin console | `https://KEYCLOAK_IP:8443` (admin / ChangeMeAdmin123!) |
 | Keycloak realm | `nifi` |
 | Keycloak client ID | `nifi` (confidential, secret in Credentials tab) |
-| Discovery URL | `http://KEYCLOAK_IP:8080/realms/nifi/.well-known/openid-configuration` |
+| Discovery URL | `https://KEYCLOAK_IP:8443/realms/nifi/.well-known/openid-configuration` |
 | NiFi UI | `https://NIFI_IP:8443/nifi` |
 | Redirect URI | `https://NIFI_IP:8443/nifi-api/access/oidc/callback` |
 | Logout URI | `https://NIFI_IP:8443/nifi-api/access/oidc/logout/callback` |
 | NiFi admin user | alice@example.com / AlicePassword123! |
 | Regular user | bob@example.com / BobPassword123! |
-| Ports | 22 = SSH, 8080 = Keycloak, 8443 = NiFi |
+| Ports | 22 = SSH, 8443 = Keycloak (HTTPS), 8443 = NiFi (HTTPS) |
 | Versions used | Keycloak 26.7.x (`:latest`), Apache NiFi 2.10.x (`:latest`) |
 
 You did it! You built a private network, launched two servers with code, stood up an identity provider, and wired a data-flow tool to use single sign-on. That's a genuinely professional skill set. 🚀

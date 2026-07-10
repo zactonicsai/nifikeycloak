@@ -25,9 +25,10 @@ resource "aws_key_pair" "tutorial" {
 }
 
 # ---------------------------------------------------------------
-# SERVER #1: KEYCLOAK
-# The user_data script installs Docker + the Compose plugin,
-# writes the docker-compose.yml, and starts Keycloak.
+# SERVER #1: KEYCLOAK (HTTPS)
+# The user_data script installs Docker, generates a self-signed
+# TLS certificate with this server's public IP baked into it,
+# then starts Keycloak serving HTTPS on port 8443.
 # (Same compose file as docker/keycloak/docker-compose.yml)
 # ---------------------------------------------------------------
 resource "aws_instance" "keycloak" {
@@ -42,9 +43,34 @@ resource "aws_instance" "keycloak" {
     #!/bin/bash
     set -e
     apt-get update -y
-    apt-get install -y docker.io docker-compose-v2
+    apt-get install -y docker.io docker-compose-v2 openssl
     systemctl enable --now docker
 
+    # ---- 1. Generate the TLS certificate ----
+    # A certificate is a signed name tag. We bake this server's
+    # PUBLIC IP into it (the subjectAltName) so browsers and NiFi
+    # can check "the name tag matches the address I dialed."
+    # We ask AWS's metadata service for the public IP.
+    CERT_DIR=/opt/keycloak/certs
+    mkdir -p $CERT_DIR
+
+    TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" \
+      -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+    PUBLIC_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+      http://169.254.169.254/latest/meta-data/public-ipv4)
+
+    openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+      -keyout $CERT_DIR/keycloak.key \
+      -out $CERT_DIR/keycloak.crt \
+      -subj "/CN=keycloak" \
+      -addext "subjectAltName=IP:$PUBLIC_IP"
+
+    # The Keycloak container runs as user id 1000 - let it read them
+    chown 1000:1000 $CERT_DIR/keycloak.key $CERT_DIR/keycloak.crt
+    chmod 600 $CERT_DIR/keycloak.key
+    chmod 644 $CERT_DIR/keycloak.crt
+
+    # ---- 2. Start Keycloak over HTTPS ----
     mkdir -p /opt/keycloak
     cat > /opt/keycloak/docker-compose.yml <<'COMPOSE'
     services:
@@ -54,31 +80,21 @@ resource "aws_instance" "keycloak" {
         command: start-dev
         restart: unless-stopped
         ports:
-          - "8080:8080"
+          - "8443:8443"
         environment:
           KC_BOOTSTRAP_ADMIN_USERNAME: admin
           KC_BOOTSTRAP_ADMIN_PASSWORD: ${var.keycloak_admin_password}
+          KC_HTTPS_CERTIFICATE_FILE: /opt/keycloak/certs/keycloak.crt
+          KC_HTTPS_CERTIFICATE_KEY_FILE: /opt/keycloak/certs/keycloak.key
         volumes:
           - keycloak_data:/opt/keycloak/data
+          - /opt/keycloak/certs:/opt/keycloak/certs:ro
 
     volumes:
       keycloak_data:
     COMPOSE
 
     cd /opt/keycloak && docker compose up -d
-
-    # LAB ONLY: wait for Keycloak to wake up, then allow plain HTTP
-    # on the master realm. Without this, browsing from the internet
-    # shows "We are sorry... HTTPS required".
-    for i in $(seq 1 60); do
-      if docker exec keycloak /opt/keycloak/bin/kcadm.sh config credentials \
-           --server http://localhost:8080 --realm master \
-           --user admin --password '${var.keycloak_admin_password}' 2>/dev/null; then
-        docker exec keycloak /opt/keycloak/bin/kcadm.sh update realms/master -s sslRequired=NONE
-        break
-      fi
-      sleep 10
-    done
   EOT
 
   tags = { Name = "keycloak-server" }
@@ -122,6 +138,25 @@ resource "aws_instance" "nifi" {
     COMPOSE
 
     cd /opt/nifi && docker compose up -d
+
+    # LAB FIX: we connect to NiFi by raw IP, but NiFi 2.x rejects
+    # requests whose TLS name (SNI) doesn't match its certificate
+    # ("HTTP ERROR 400 Invalid SNI"). Wait for NiFi to write its
+    # config file, relax the check, and restart once.
+    P=/opt/nifi/nifi-current/conf/nifi.properties
+    for i in $(seq 1 60); do
+      if docker exec nifi test -s $P 2>/dev/null; then
+        docker exec nifi bash -c "grep -q '^nifi.web.https.sni.host.check=' $P \
+          && sed -i 's|^nifi.web.https.sni.host.check=.*|nifi.web.https.sni.host.check=false|' $P \
+          || echo 'nifi.web.https.sni.host.check=false' >> $P"
+        docker exec nifi bash -c "grep -q '^nifi.web.https.sni.required=' $P \
+          && sed -i 's|^nifi.web.https.sni.required=.*|nifi.web.https.sni.required=false|' $P \
+          || echo 'nifi.web.https.sni.required=false' >> $P"
+        docker restart nifi
+        break
+      fi
+      sleep 10
+    done
   EOT
 
   tags = { Name = "nifi-server" }

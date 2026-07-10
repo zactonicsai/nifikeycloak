@@ -1,9 +1,10 @@
 # ---------------------------------------------------------------
 # BOUNCER #1: Keycloak security group.
 #   - Door 22 (SSH): only YOUR laptop
-#   - Door 8080 (Keycloak web + OIDC): open to all, because both
-#     your browser AND the NiFi server must reach it.
-#     LAB ONLY - lock this down in production!
+#   - Door 8443 (Keycloak HTTPS web + OIDC): open to all, because
+#     both your browser AND the NiFi server must reach it.
+#     Traffic is now encrypted, but still lock this down to known
+#     IPs in production!
 # ---------------------------------------------------------------
 resource "aws_security_group" "keycloak" {
   name        = "keycloak-sg"
@@ -19,9 +20,9 @@ resource "aws_security_group" "keycloak" {
   }
 
   ingress {
-    description = "Keycloak web + OIDC traffic (lab only!)"
-    from_port   = 8080
-    to_port     = 8080
+    description = "Keycloak HTTPS web + OIDC traffic"
+    from_port   = 8443
+    to_port     = 8443
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
